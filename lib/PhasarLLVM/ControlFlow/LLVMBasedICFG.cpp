@@ -15,14 +15,19 @@
  */
 
 #include <cassert>
+#include <initializer_list>
 #include <memory>
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/AbstractCallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #include "boost/graph/copy.hpp"
@@ -30,6 +35,7 @@
 #include "boost/graph/graph_utility.hpp"
 #include "boost/graph/graphviz.hpp"
 
+#include "nlohmann/json.hpp"
 #include "phasar/PhasarLLVM/ControlFlow/LLVMBasedICFG.h"
 #include "phasar/PhasarLLVM/ControlFlow/Resolver/CHAResolver.h"
 #include "phasar/PhasarLLVM/ControlFlow/Resolver/DTAResolver.h"
@@ -38,6 +44,7 @@
 #include "phasar/PhasarLLVM/ControlFlow/Resolver/RTAResolver.h"
 #include "phasar/PhasarLLVM/ControlFlow/Resolver/Resolver.h"
 
+#include "phasar/Utils/LLVMIRToSrc.h"
 #include "phasar/Utils/LLVMShorthands.h"
 #include "phasar/Utils/Logger.h"
 #include "phasar/Utils/PAMMMacros.h"
@@ -405,12 +412,12 @@ std::unique_ptr<Resolver> LLVMBasedICFG::makeResolver(ProjectIRDB &IRDB,
 }
 
 bool LLVMBasedICFG::isIndirectFunctionCall(const llvm::Instruction *N) const {
-  const llvm::CallBase *CallSite = llvm::cast<llvm::CallBase>(N);
+  const auto *CallSite = llvm::cast<llvm::CallBase>(N);
   return CallSite->isIndirectCall();
 }
 
 bool LLVMBasedICFG::isVirtualFunctionCall(const llvm::Instruction *N) const {
-  const llvm::CallBase *CallSite = llvm::cast<llvm::CallBase>(N);
+  const auto *CallSite = llvm::cast<llvm::CallBase>(N);
   // check potential receiver type
   const auto *RecType = getReceiverType(CallSite);
   if (!RecType) {
@@ -520,7 +527,7 @@ size_t LLVMBasedICFG::getCallerCount(const llvm::Function *F) const {
 
 set<const llvm::Function *>
 LLVMBasedICFG::getCalleesOfCallAt(const llvm::Instruction *N) const {
-  if (llvm::isa<llvm::CallInst>(N) || llvm::isa<llvm::InvokeInst>(N)) {
+  if (llvm::isa<llvm::CallBase>(N)) {
     set<const llvm::Function *> Callees;
     auto MapEntry = FunctionVertexMap.find(N->getFunction());
     if (MapEntry == FunctionVertexMap.end()) {
@@ -538,9 +545,9 @@ LLVMBasedICFG::getCalleesOfCallAt(const llvm::Instruction *N) const {
       }
     }
     return Callees;
-  } else {
-    return {};
   }
+
+  return {};
 }
 
 set<const llvm::Instruction *>
@@ -619,8 +626,7 @@ set<const llvm::Instruction *> LLVMBasedICFG::allNonCallStartNodes() const {
     for (auto &F : *M) {
       for (auto &BB : F) {
         for (auto &I : BB) {
-          if ((!llvm::isa<llvm::CallInst>(&I)) &&
-              (!llvm::isa<llvm::InvokeInst>(&I)) && (!isStartPoint(&I))) {
+          if (!llvm::isa<llvm::CallBase>(&I) && !isStartPoint(&I)) {
             NonCallStartNodes.insert(&I);
           }
         }
@@ -750,6 +756,198 @@ nlohmann::json LLVMBasedICFG::getAsJson() const {
 }
 
 void LLVMBasedICFG::printAsJson(std::ostream &OS) const { OS << getAsJson(); }
+
+nlohmann::json LLVMBasedICFG::exportICFGAsJson() const {
+  nlohmann::json J;
+
+  llvm::DenseSet<const llvm::Instruction *> handledCallSites;
+
+  for (const auto *F : getAllFunctions()) {
+    for (auto &[From, To] : getAllControlFlowEdges(F)) {
+      if (llvm::isa<llvm::UnreachableInst>(From)) {
+        continue;
+      }
+
+      if (const auto *Call = llvm::dyn_cast<llvm::CallBase>(From)) {
+        auto [unused, inserted] = handledCallSites.insert(Call);
+
+        for (const auto *Callee : getCalleesOfCallAt(Call)) {
+          if (Callee->isDeclaration()) {
+            continue;
+          }
+          if (inserted) {
+            J.push_back({{"from", llvmIRToString(From)},
+                         {"to", llvmIRToString(&Callee->front().front())}});
+          }
+
+          for (const auto *ExitInst : getAllExitStatements(Callee)) {
+            J.push_back({{"from", llvmIRToString(ExitInst)},
+                         {"to", llvmIRToString(To)}});
+          }
+        }
+
+      } else {
+        J.push_back(
+            {{"from", llvmIRToString(From)}, {"to", llvmIRToString(To)}});
+      }
+    }
+  }
+
+  return J;
+}
+
+struct SourceCodeInfoWithIR : public SourceCodeInfo {
+  std::string IR;
+};
+
+void from_json(const nlohmann::json &J, SourceCodeInfoWithIR &Info) {
+  from_json(J, static_cast<SourceCodeInfo &>(Info));
+  J.at("IR").get_to(Info.IR);
+}
+void to_json(nlohmann::json &J, const SourceCodeInfoWithIR &Info) {
+  to_json(J, static_cast<const SourceCodeInfo &>(Info));
+  J["IR"] = Info.IR;
+}
+
+nlohmann::json LLVMBasedICFG::exportICFGAsSourceCodeJson() const {
+  nlohmann::json J;
+
+  struct GetFirstNonEmpty {
+    SourceCodeInfoWithIR operator()(llvm::BasicBlock::const_iterator &it,
+                                    llvm::BasicBlock::const_iterator end) {
+      assert(it != end);
+
+      const auto *Inst = &*it;
+      auto ret = getSrcCodeInfoFromIR(Inst);
+
+      // Assume, we aren't skipping relevant calls here
+
+      while ((ret.empty() || it->isDebugOrPseudoInst()) && ++it != end) {
+        Inst = &*it;
+        ret = getSrcCodeInfoFromIR(Inst);
+      }
+
+      return {ret, llvmIRToString(Inst)};
+    }
+
+    SourceCodeInfoWithIR operator()(const llvm::BasicBlock *BB) {
+      auto it = BB->begin();
+      return (*this)(it, BB->end());
+    }
+  } getFirstNonEmpty;
+
+  auto isRetVoid = [](const llvm::Instruction *Inst) {
+    const auto *Ret = llvm::dyn_cast<llvm::ReturnInst>(Inst);
+    return Ret && !Ret->getReturnValue();
+  };
+
+  auto getLastNonEmpty =
+      [&](const llvm::Instruction *Inst) -> SourceCodeInfoWithIR {
+    if (!isRetVoid(Inst) || !Inst->getPrevNode()) {
+      return {getSrcCodeInfoFromIR(Inst), llvmIRToString(Inst)};
+    }
+    for (const auto *Prev = Inst->getPrevNode(); Prev;
+         Prev = Prev->getPrevNode()) {
+      auto Src = getSrcCodeInfoFromIR(Prev);
+      if (!Src.empty()) {
+        return {Src, llvmIRToString(Prev)};
+      }
+    }
+
+    return {getSrcCodeInfoFromIR(Inst), llvmIRToString(Inst)};
+  };
+
+  auto createInterEdges = [&](const llvm::Instruction *CS,
+                              const SourceCodeInfoWithIR &From,
+                              std::initializer_list<SourceCodeInfoWithIR> Tos) {
+    for (const auto *Callee : getCalleesOfCallAt(CS)) {
+      if (Callee->isDeclaration()) {
+        continue;
+      }
+
+      // Call Edge
+      auto InterTo = getFirstNonEmpty(&Callee->front());
+      J.push_back({{"from", From}, {"to", std::move(InterTo)}});
+
+      // Return Edges
+      for (const auto *ExitInst : getAllExitStatements(Callee)) {
+        for (const auto &To : Tos) {
+          J.push_back({{"from", getLastNonEmpty(ExitInst)}, {"to", To}});
+        }
+      }
+    }
+  };
+
+  for (const auto *F : getAllFunctions()) {
+    for (const auto &BB : *F) {
+      assert(!BB.empty() && "Invalid IR: Empty BasicBlock");
+      auto it = BB.begin();
+      auto end = BB.end();
+      auto From = getFirstNonEmpty(it, end);
+
+      if (it == end) {
+        continue;
+      }
+
+      const auto *FromInst = &*it;
+
+      ++it;
+
+      // Edges inside the BasicBlock
+      for (; it != end; ++it) {
+        auto To = getFirstNonEmpty(it, end);
+        if (To.empty()) {
+          break;
+        }
+
+        if (const auto *Call = llvm::dyn_cast<llvm::CallBase>(FromInst)) {
+          // Call- and Return Edges
+          createInterEdges(FromInst, From, {To});
+        } else if (From != To && !isRetVoid(&*it)) {
+          // Normal Edge
+          J.push_back({{"from", From}, {"to", To}});
+        }
+
+        FromInst = &*it;
+        From = std::move(To);
+      }
+
+      const auto *Term = BB.getTerminator();
+      assert(Term && "Invalid IR: BasicBlock without terminating instruction!");
+
+      auto numSuccessors = Term->getNumSuccessors();
+
+      if (numSuccessors == 0) {
+        // Return edges already handled
+      } else if (const auto *Invoke = llvm::dyn_cast<llvm::InvokeInst>(Term)) {
+        // Invoke Edges (they are not handled by the Call edges, because they
+        // are always terminator instructions)
+
+        // Note: The unwindDest is never reachable from a return instruction.
+        // However, this is how it is modeled in the ICFG at the moment
+        createInterEdges(Term,
+                         SourceCodeInfoWithIR{getSrcCodeInfoFromIR(Term),
+                                              llvmIRToString(Term)},
+                         {getFirstNonEmpty(Invoke->getNormalDest()),
+                          getFirstNonEmpty(Invoke->getUnwindDest())});
+        // Call Edges
+      } else {
+        // Branch Edges
+        for (size_t i = 0; i < numSuccessors; ++i) {
+          auto *Succ = Term->getSuccessor(i);
+          assert(Succ && !Succ->empty());
+
+          auto To = getFirstNonEmpty(Succ);
+          if (From != To) {
+            J.push_back({{"from", From}, {"to", std::move(To)}});
+          }
+        }
+      }
+    }
+  }
+
+  return J;
+}
 
 vector<const llvm::Function *> LLVMBasedICFG::getDependencyOrderedFunctions() {
   vector<vertex_t> Vertices;
